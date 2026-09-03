@@ -1,0 +1,18 @@
+# 在 GitHub 仓库中创建 .github/workflows/build.yml
+name: Build EXE
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup bflat
+        run: |
+          curl -L https://github.com/bflattened/bflat/releases/download/v8.0.2/bflat-8.0.2-linux-glibc-x64.tar.gz | tar -xz
+      - name: Build
+        run: ./bflat build cam.cs -o cam.exe --os windows --arch x64
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraCheck
+          path: cam.exe
