@@ -10,7 +10,17 @@ using Microsoft.Win32;
 class Program
 {
     // ==========================================
-    // 1. Win32 音效 API
+    // 1. 隐藏控制台黑框 (代码层实现，免去复杂的链接器配置)
+    // ==========================================
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_HIDE = 0;
+
+    // ==========================================
+    // 2. Win32 音效 API
     // ==========================================
     [DllImport("winmm.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool PlaySound(string pszSound, IntPtr hmod, uint fdwSound);
@@ -21,7 +31,7 @@ class Program
     static void PlayUsbDisconnect() => PlaySound("DeviceDisconnect", IntPtr.Zero, SND_ALIAS | SND_ASYNC);
 
     // ==========================================
-    // 2. Win32 进程全路径查询 API
+    // 3. Win32 进程全路径查询 API
     // ==========================================
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
@@ -31,15 +41,25 @@ class Program
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
-
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     // ==========================================
-    // 3. Windows WASAPI (Core Audio) COM 接口定义
+    // 4. 原生 COM 激活 API (Native AOT 专用)
     // ==========================================
-    [ComImport]
-    [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-    private class MMDeviceEnumeratorComObject { }
+    [DllImport("ole32.dll", ExactSpelling = true)]
+    private static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
+
+    [DllImport("ole32.dll", ExactSpelling = true)]
+    private static extern int CoCreateInstance(
+        [In, MarshalAs(UnmanagedType.LPStruct)] Guid rclsid,
+        IntPtr pUnkOuter,
+        uint dwClsContext,
+        [In, MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+        [MarshalAs(UnmanagedType.Interface)] out IMMDeviceEnumerator ppv);
+
+    private static readonly Guid CLSID_MMDeviceEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
+    private static readonly Guid IID_IMMDeviceEnumerator = new Guid("A95664D2-9614-4F35-A746-DE8DB63617E6");
+    private static readonly Guid IID_IAudioSessionManager2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
 
     [ComImport]
     [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
@@ -99,7 +119,7 @@ class Program
     }
 
     // ==========================================
-    // 4. 业务逻辑
+    // 5. 业务逻辑
     // ==========================================
     private static readonly string LogFilePath = @"D:\Microphone_Usage_Log.txt";
     private static bool _wasCameraInUse = false;
@@ -107,11 +127,15 @@ class Program
 
     static void Main(string[] args)
     {
-        Console.WriteLine("==================================================");
-        Console.WriteLine("摄像头/麦克风 硬件级低延迟监听服务 (bflat Native)");
-        Console.WriteLine("麦克风引擎: WASAPI CoreAudio 会话级轮询 (精确PID/零延迟)");
-        Console.WriteLine("摄像头引擎: 全局注册表 + 进程存活交叉校验 (防幽灵误报)");
-        Console.WriteLine("==================================================");
+        // 1. 静默运行：自动隐藏控制台黑框 (调试时可以把这行注释掉)
+        IntPtr hConsole = GetConsoleWindow();
+        if (hConsole != IntPtr.Zero)
+        {
+            ShowWindow(hConsole, SW_HIDE);
+        }
+
+        // 2. 初始化 COM 线程环境 (COINIT_MULTITHREADED = 0)
+        CoInitializeEx(IntPtr.Zero, 0);
 
         while (true)
         {
@@ -120,19 +144,12 @@ class Program
                 CheckCameraState();
                 CheckMicrophoneViaWASAPI();
             }
-            catch (Exception ex)
-            {
-                // 生产环境静默或记录内部异常
-                Debug.WriteLine($"Error: {ex.Message}");
-            }
+            catch { }
 
-            Thread.Sleep(150); // 150ms 高频低开销轮询，响应极快
+            Thread.Sleep(150); // 150毫秒高频低功耗轮询
         }
     }
 
-    /// <summary>
-    /// 利用 WASAPI 直接向声卡驱动查询麦克风占用
-    /// </summary>
     static void CheckMicrophoneViaWASAPI()
     {
         IMMDeviceEnumerator enumerator = null;
@@ -144,13 +161,16 @@ class Program
 
         try
         {
-            enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+            // 通过 Win32 原生 CoCreateInstance 实例化
+            int hr = CoCreateInstance(CLSID_MMDeviceEnumerator, IntPtr.Zero, 1 /* CLSCTX_INPROC_SERVER */, IID_IMMDeviceEnumerator, out enumerator);
+            if (hr != 0 || enumerator == null) return;
+
             // eCapture = 1, eConsole = 0
-            int hr = enumerator.GetDefaultAudioEndpoint(1, 0, out micDevice);
+            hr = enumerator.GetDefaultAudioEndpoint(1, 0, out micDevice);
             if (hr != 0 || micDevice == null) return;
 
-            Guid IID_IAudioSessionManager2 = typeof(IAudioSessionManager2).GUID;
-            hr = micDevice.Activate(ref IID_IAudioSessionManager2, 23 /* CLSCTX_ALL */, IntPtr.Zero, out object sessionManagerObj);
+            Guid iidMgr = IID_IAudioSessionManager2;
+            hr = micDevice.Activate(ref iidMgr, 23 /* CLSCTX_ALL */, IntPtr.Zero, out object sessionManagerObj);
             if (hr != 0 || sessionManagerObj == null) return;
 
             sessionManager = (IAudioSessionManager2)sessionManagerObj;
@@ -168,7 +188,7 @@ class Program
                     if (sessionControl == null) continue;
 
                     sessionControl.GetState(out int state);
-                    // AudioSessionStateActive = 1 (声卡正在从该会话捕获数据)
+                    // 状态 1 = AudioSessionStateActive
                     if (state == 1)
                     {
                         sessionControl.GetProcessId(out uint pid);
@@ -182,9 +202,7 @@ class Program
                                 string timeStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                                 string logContent = $"[时间: {timeStr}] [PID: {pid}] 进程调用了麦克风: {procName}{Environment.NewLine}";
 
-                                Console.Write(logContent);
                                 WriteLog(logContent);
-
                                 _activeMicPids.Add(pid);
                             }
                         }
@@ -204,26 +222,20 @@ class Program
             if (enumerator != null) Marshal.ReleaseComObject(enumerator);
         }
 
-        // 移除已经停止录音的 PID
         _activeMicPids.RemoveWhere(pid => !currentPids.Contains(pid));
     }
 
-    /// <summary>
-    /// 检测摄像头：穿透 HKCU 与 HKLM，并交叉验证进程存活状态
-    /// </summary>
     static void CheckCameraState()
     {
         bool isInUse = IsCameraPhysicallyActive();
 
         if (isInUse && !_wasCameraInUse)
         {
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 摄像头激活 -> 播放连接音效");
             PlayUsbConnect();
             _wasCameraInUse = true;
         }
         else if (!isInUse && _wasCameraInUse)
         {
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] 摄像头关闭 -> 播放断开音效");
             PlayUsbDisconnect();
             _wasCameraInUse = false;
         }
@@ -232,8 +244,6 @@ class Program
     static bool IsCameraPhysicallyActive()
     {
         string subPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
-        
-        // 同时扫描 HKCU (用户级) 和 HKLM (系统级/服务级)
         return CheckConsentStoreKey(Registry.CurrentUser, subPath) || 
                CheckConsentStoreKey(Registry.LocalMachine, subPath);
     }
@@ -244,7 +254,7 @@ class Program
         {
             if (baseKey == null) return false;
 
-            // 1. 检查桌面程序 (NonPackaged)
+            // 1. 桌面程序
             using (var nonPackagedKey = baseKey.OpenSubKey("NonPackaged"))
             {
                 if (nonPackagedKey != null)
@@ -262,14 +272,14 @@ class Program
                 }
             }
 
-            // 2. 检查 UWP 应用
+            // 2. UWP 应用
             foreach (var keyName in baseKey.GetSubKeyNames())
             {
                 if (keyName.Equals("NonPackaged", StringComparison.OrdinalIgnoreCase)) continue;
 
                 using (var appKey = baseKey.OpenSubKey(keyName))
                 {
-                    if (appKey != null && CheckIsActiveUwp(appKey, keyName))
+                    if (appKey != null && CheckIsActiveUwp(appKey))
                     {
                         return true;
                     }
@@ -279,9 +289,6 @@ class Program
         return false;
     }
 
-    /// <summary>
-    /// 检查并进行存活校验：解决由于程序崩溃导致的残留 LastUsedTimeStop == 0 误报
-    /// </summary>
     static bool CheckIsActiveWithLiveness(RegistryKey appKey, string rawKeyName)
     {
         var stopTimeObj = appKey.GetValue("LastUsedTimeStop");
@@ -290,30 +297,21 @@ class Program
         if (startTimeObj is long startTime && startTime > 0)
         {
             long stopTime = stopTimeObj is long l ? l : -1;
-
-            // 注册表显示正在使用 (stopTime == 0 或 停止时间早于启动时间)
             if (stopTime == 0 || stopTime < startTime)
             {
-                // 还原 exe 真实进程名称
                 string appPath = rawKeyName.Replace('#', '\\');
                 string exeName = Path.GetFileNameWithoutExtension(appPath);
 
                 if (string.IsNullOrEmpty(exeName)) return false;
 
-                // 核心防误报：去系统检查这个进程是否真的还活在内存中
-                Process[] procs = Process.GetProcessesByName(exeName);
-                if (procs.Length > 0)
-                {
-                    // 进程确实活着，确实正在占用
-                    return true;
-                }
-                // 如果进程都退出了，说明是注册表脏数据，忽略
+                // 交叉校验：进程必须真正存活才判定为占用
+                return Process.GetProcessesByName(exeName).Length > 0;
             }
         }
         return false;
     }
 
-    static bool CheckIsActiveUwp(RegistryKey appKey, string packageFamilyName)
+    static bool CheckIsActiveUwp(RegistryKey appKey)
     {
         var stopTimeObj = appKey.GetValue("LastUsedTimeStop");
         var startTimeObj = appKey.GetValue("LastUsedTimeStart");
@@ -323,7 +321,6 @@ class Program
             long stopTime = stopTimeObj is long l ? l : -1;
             if (stopTime == 0 || stopTime < startTime)
             {
-                // UWP 存活检测：检查常见 UWP 宿主是否存活
                 return Process.GetProcessesByName("ApplicationFrameHost").Length > 0 ||
                        Process.GetProcessesByName("WindowsCamera").Length > 0;
             }
@@ -331,9 +328,6 @@ class Program
         return false;
     }
 
-    /// <summary>
-    /// 跨权限/全用户 获取真实进程全路径
-    /// </summary>
     static string GetProcessNameAndPath(int pid)
     {
         IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
@@ -356,12 +350,11 @@ class Program
 
         try
         {
-            var p = Process.GetProcessById(pid);
-            return p.ProcessName + ".exe";
+            return Process.GetProcessById(pid).ProcessName + ".exe";
         }
         catch
         {
-            return $"PID_{pid} (无法获取路径/已退出)";
+            return $"PID_{pid}";
         }
     }
 
