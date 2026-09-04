@@ -5,22 +5,11 @@ using System.Threading;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using Microsoft.Win32;
 
 class Program
 {
     // ==========================================
-    // 1. 隐藏控制台黑框 (代码层实现，免去复杂的链接器配置)
-    // ==========================================
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    private const int SW_HIDE = 0;
-
-    // ==========================================
-    // 2. Win32 音效 API
+    // 1. 系统音效 & 窗口隐藏
     // ==========================================
     [DllImport("winmm.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern bool PlaySound(string pszSound, IntPtr hmod, uint fdwSound);
@@ -30,9 +19,29 @@ class Program
     static void PlayUsbConnect() => PlaySound("DeviceConnect", IntPtr.Zero, SND_ALIAS | SND_ASYNC);
     static void PlayUsbDisconnect() => PlaySound("DeviceDisconnect", IntPtr.Zero, SND_ALIAS | SND_ASYNC);
 
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_HIDE = 0;
+
     // ==========================================
-    // 3. Win32 进程全路径查询 API
+    // 2. 进程 I/O 速率监测 (判断是否在传输视频数据)
     // ==========================================
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount; // 包含了网络 Socket 发送和磁盘写入的总字节数
+        public ulong OtherTransferCount;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS lpIoCounters);
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
 
@@ -41,10 +50,11 @@ class Program
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
+
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     // ==========================================
-    // 4. 原生 COM 激活 API (Native AOT 专用)
+    // 3. WASAPI 音频输出监听 (监听对方远程发声)
     // ==========================================
     [DllImport("ole32.dll", ExactSpelling = true)]
     private static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
@@ -119,41 +129,127 @@ class Program
     }
 
     // ==========================================
-    // 5. 业务逻辑
+    // 4. 业务监控状态
     // ==========================================
-    private static readonly string LogFilePath = @"D:\Microphone_Usage_Log.txt";
-    private static bool _wasCameraInUse = false;
-    private static readonly HashSet<uint> _activeMicPids = new HashSet<uint>();
+    private static readonly string LogFilePath = @"D:\Remote_Activity_Log.txt";
+    
+    // 判定为“正在视频推流”的写入速率门限（单位：KB/s）
+    // 视频传输（720P/1080P）通常在 150KB/s ~ 1500KB/s 以上
+    private const double VIDEO_STREAM_THRESHOLD_KB = 120.0;
+
+    // 记录各进程历史 IO 状态
+    private static readonly Dictionary<int, (ulong LastBytes, DateTime LastTime)> _processIoHistory = new();
+    private static readonly HashSet<int> _activeStreamingPids = new();
+    private static readonly HashSet<uint> _activeSpeakerPids = new();
 
     static void Main(string[] args)
     {
-        // 1. 静默运行：自动隐藏控制台黑框 (调试时可以把这行注释掉)
+        // 自动隐藏黑框（静默运行）
         IntPtr hConsole = GetConsoleWindow();
         if (hConsole != IntPtr.Zero)
         {
             ShowWindow(hConsole, SW_HIDE);
         }
 
-        // 2. 初始化 COM 线程环境 (COINIT_MULTITHREADED = 0)
         CoInitializeEx(IntPtr.Zero, 0);
 
         while (true)
         {
             try
             {
-                CheckCameraState();
-                CheckMicrophoneViaWASAPI();
+                // 1. 监控：远控推流传输（突发大流量发送 -> 拔插U盘音效）
+                MonitorDataStreaming();
+
+                // 2. 监控：远控说话外放（扬声器播放声音 -> 记录日志到 D 盘）
+                MonitorRemoteVoicePlayback();
             }
             catch { }
 
-            Thread.Sleep(150); // 150毫秒高频低功耗轮询
+            Thread.Sleep(300); // 300ms 采样周期，灵敏且极低 CPU 占用
         }
     }
 
-    static void CheckMicrophoneViaWASAPI()
+    /// <summary>
+    /// 监测进程的实时写入速率，判断是否正在向远端发送视频流
+    /// </summary>
+    static void MonitorDataStreaming()
+    {
+        Process[] processes = Process.GetProcesses();
+        DateTime now = DateTime.Now;
+        var currentActiveStreaming = new HashSet<int>();
+
+        foreach (var p in processes)
+        {
+            int pid = p.Id;
+            if (pid <= 4) continue; // 跳过 System/Idle 进程
+
+            IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProcess == IntPtr.Zero) continue;
+
+            try
+            {
+                if (GetProcessIoCounters(hProcess, out IO_COUNTERS io))
+                {
+                    ulong currentBytes = io.WriteTransferCount;
+
+                    if (_processIoHistory.TryGetValue(pid, out var lastRecord))
+                    {
+                        double elapsedSeconds = (now - lastRecord.LastTime).TotalSeconds;
+                        if (elapsedSeconds > 0.1)
+                        {
+                            // 计算此进程当前的写入速率 (KB/s)
+                            double speedKBps = ((currentBytes - lastRecord.LastBytes) / 1024.0) / elapsedSeconds;
+
+                            // 如果速率超过阈值，判定为正在传输推流数据
+                            if (speedKBps >= VIDEO_STREAM_THRESHOLD_KB)
+                            {
+                                currentActiveStreaming.Add(pid);
+
+                                if (!_activeStreamingPids.Contains(pid))
+                                {
+                                    string procPath = GetProcessPath(hProcess, pid);
+                                    WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [开始推流] 进程: {procPath}, 速率: {speedKBps:F1} KB/s");
+                                    PlayUsbConnect(); // 开始传输画面 -> 发出插 U 盘提示音
+                                    _activeStreamingPids.Add(pid);
+                                }
+                            }
+                        }
+                    }
+
+                    _processIoHistory[pid] = (currentBytes, now);
+                }
+            }
+            finally
+            {
+                CloseHandle(hProcess);
+            }
+        }
+
+        // 检查哪些进程停止了推流
+        var stoppedPids = new List<int>();
+        foreach (int pid in _activeStreamingPids)
+        {
+            if (!currentActiveStreaming.Contains(pid))
+            {
+                stoppedPids.Add(pid);
+                WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [停止推流] PID: {pid} 已断开/停止视频传输");
+                PlayUsbDisconnect(); // 停止传输画面 -> 发出拔 U 盘提示音
+            }
+        }
+
+        foreach (int pid in stoppedPids)
+        {
+            _activeStreamingPids.Remove(pid);
+        }
+    }
+
+    /// <summary>
+    /// 监测扬声器/耳机输出：当有远控进程在本地播放对方语音时记录日志
+    /// </summary>
+    static void MonitorRemoteVoicePlayback()
     {
         IMMDeviceEnumerator enumerator = null;
-        IMMDevice micDevice = null;
+        IMMDevice speakerDevice = null;
         IAudioSessionManager2 sessionManager = null;
         IAudioSessionEnumerator sessionEnum = null;
 
@@ -161,16 +257,15 @@ class Program
 
         try
         {
-            // 通过 Win32 原生 CoCreateInstance 实例化
-            int hr = CoCreateInstance(CLSID_MMDeviceEnumerator, IntPtr.Zero, 1 /* CLSCTX_INPROC_SERVER */, IID_IMMDeviceEnumerator, out enumerator);
+            int hr = CoCreateInstance(CLSID_MMDeviceEnumerator, IntPtr.Zero, 1, IID_IMMDeviceEnumerator, out enumerator);
             if (hr != 0 || enumerator == null) return;
 
-            // eCapture = 1, eConsole = 0
-            hr = enumerator.GetDefaultAudioEndpoint(1, 0, out micDevice);
-            if (hr != 0 || micDevice == null) return;
+            // eRender = 0 (监听扬声器/播放输出端), eConsole = 0
+            hr = enumerator.GetDefaultAudioEndpoint(0, 0, out speakerDevice);
+            if (hr != 0 || speakerDevice == null) return;
 
             Guid iidMgr = IID_IAudioSessionManager2;
-            hr = micDevice.Activate(ref iidMgr, 23 /* CLSCTX_ALL */, IntPtr.Zero, out object sessionManagerObj);
+            hr = speakerDevice.Activate(ref iidMgr, 23, IntPtr.Zero, out object sessionManagerObj);
             if (hr != 0 || sessionManagerObj == null) return;
 
             sessionManager = (IAudioSessionManager2)sessionManagerObj;
@@ -181,36 +276,34 @@ class Program
 
             for (int i = 0; i < count; i++)
             {
-                IAudioSessionControl2 sessionControl = null;
+                IAudioSessionControl2 session = null;
                 try
                 {
-                    sessionEnum.GetSession(i, out sessionControl);
-                    if (sessionControl == null) continue;
+                    sessionEnum.GetSession(i, out session);
+                    if (session == null) continue;
 
-                    sessionControl.GetState(out int state);
-                    // 状态 1 = AudioSessionStateActive
+                    session.GetState(out int state);
+                    // state == 1 代表该会话正在外放声音
                     if (state == 1)
                     {
-                        sessionControl.GetProcessId(out uint pid);
+                        session.GetProcessId(out uint pid);
                         if (pid > 0)
                         {
                             currentPids.Add(pid);
 
-                            if (!_activeMicPids.Contains(pid))
+                            if (!_activeSpeakerPids.Contains(pid))
                             {
-                                string procName = GetProcessNameAndPath((int)pid);
-                                string timeStr = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                                string logContent = $"[时间: {timeStr}] [PID: {pid}] 进程调用了麦克风: {procName}{Environment.NewLine}";
-
-                                WriteLog(logContent);
-                                _activeMicPids.Add(pid);
+                                string procName = GetProcessNameOnly((int)pid);
+                                // 过滤掉常见的正常播放软件（如果需要可以自行调整）
+                                WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [语音上线] 进程正在外放声音 (对方可能在讲话): {procName} (PID: {pid})");
+                                _activeSpeakerPids.Add(pid);
                             }
                         }
                     }
                 }
                 finally
                 {
-                    if (sessionControl != null) Marshal.ReleaseComObject(sessionControl);
+                    if (session != null) Marshal.ReleaseComObject(session);
                 }
             }
         }
@@ -218,136 +311,26 @@ class Program
         {
             if (sessionEnum != null) Marshal.ReleaseComObject(sessionEnum);
             if (sessionManager != null) Marshal.ReleaseComObject(sessionManager);
-            if (micDevice != null) Marshal.ReleaseComObject(micDevice);
+            if (speakerDevice != null) Marshal.ReleaseComObject(speakerDevice);
             if (enumerator != null) Marshal.ReleaseComObject(enumerator);
         }
 
-        _activeMicPids.RemoveWhere(pid => !currentPids.Contains(pid));
+        _activeSpeakerPids.RemoveWhere(pid => !currentPids.Contains(pid));
     }
 
-    static void CheckCameraState()
+    static string GetProcessPath(IntPtr hProcess, int pid)
     {
-        bool isInUse = IsCameraPhysicallyActive();
-
-        if (isInUse && !_wasCameraInUse)
+        var sb = new StringBuilder(1024);
+        int size = sb.Capacity;
+        if (QueryFullProcessImageName(hProcess, 0, sb, ref size))
         {
-            PlayUsbConnect();
-            _wasCameraInUse = true;
+            return sb.ToString();
         }
-        else if (!isInUse && _wasCameraInUse)
-        {
-            PlayUsbDisconnect();
-            _wasCameraInUse = false;
-        }
+        return GetProcessNameOnly(pid);
     }
 
-    static bool IsCameraPhysicallyActive()
+    static string GetProcessNameOnly(int pid)
     {
-        string subPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
-        return CheckConsentStoreKey(Registry.CurrentUser, subPath) || 
-               CheckConsentStoreKey(Registry.LocalMachine, subPath);
-    }
-
-    static bool CheckConsentStoreKey(RegistryKey rootKey, string subPath)
-    {
-        using (var baseKey = rootKey.OpenSubKey(subPath))
-        {
-            if (baseKey == null) return false;
-
-            // 1. 桌面程序
-            using (var nonPackagedKey = baseKey.OpenSubKey("NonPackaged"))
-            {
-                if (nonPackagedKey != null)
-                {
-                    foreach (var keyName in nonPackagedKey.GetSubKeyNames())
-                    {
-                        using (var appKey = nonPackagedKey.OpenSubKey(keyName))
-                        {
-                            if (appKey != null && CheckIsActiveWithLiveness(appKey, keyName))
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. UWP 应用
-            foreach (var keyName in baseKey.GetSubKeyNames())
-            {
-                if (keyName.Equals("NonPackaged", StringComparison.OrdinalIgnoreCase)) continue;
-
-                using (var appKey = baseKey.OpenSubKey(keyName))
-                {
-                    if (appKey != null && CheckIsActiveUwp(appKey))
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    static bool CheckIsActiveWithLiveness(RegistryKey appKey, string rawKeyName)
-    {
-        var stopTimeObj = appKey.GetValue("LastUsedTimeStop");
-        var startTimeObj = appKey.GetValue("LastUsedTimeStart");
-
-        if (startTimeObj is long startTime && startTime > 0)
-        {
-            long stopTime = stopTimeObj is long l ? l : -1;
-            if (stopTime == 0 || stopTime < startTime)
-            {
-                string appPath = rawKeyName.Replace('#', '\\');
-                string exeName = Path.GetFileNameWithoutExtension(appPath);
-
-                if (string.IsNullOrEmpty(exeName)) return false;
-
-                // 交叉校验：进程必须真正存活才判定为占用
-                return Process.GetProcessesByName(exeName).Length > 0;
-            }
-        }
-        return false;
-    }
-
-    static bool CheckIsActiveUwp(RegistryKey appKey)
-    {
-        var stopTimeObj = appKey.GetValue("LastUsedTimeStop");
-        var startTimeObj = appKey.GetValue("LastUsedTimeStart");
-
-        if (startTimeObj is long startTime && startTime > 0)
-        {
-            long stopTime = stopTimeObj is long l ? l : -1;
-            if (stopTime == 0 || stopTime < startTime)
-            {
-                return Process.GetProcessesByName("ApplicationFrameHost").Length > 0 ||
-                       Process.GetProcessesByName("WindowsCamera").Length > 0;
-            }
-        }
-        return false;
-    }
-
-    static string GetProcessNameAndPath(int pid)
-    {
-        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (hProcess != IntPtr.Zero)
-        {
-            try
-            {
-                var sb = new StringBuilder(1024);
-                int size = sb.Capacity;
-                if (QueryFullProcessImageName(hProcess, 0, sb, ref size))
-                {
-                    return sb.ToString();
-                }
-            }
-            finally
-            {
-                CloseHandle(hProcess);
-            }
-        }
-
         try
         {
             return Process.GetProcessById(pid).ProcessName + ".exe";
@@ -362,7 +345,7 @@ class Program
     {
         try
         {
-            File.AppendAllText(LogFilePath, content, Encoding.UTF8);
+            File.AppendAllText(LogFilePath, content + Environment.NewLine, Encoding.UTF8);
         }
         catch { }
     }
