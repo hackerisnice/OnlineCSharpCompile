@@ -26,7 +26,7 @@ class Program
     private const int SW_HIDE = 0;
 
     // ==========================================
-    // 2. 进程 I/O 速率监测 (判断是否在传输视频数据)
+    // 2. 进程 I/O 速率监测
     // ==========================================
     [StructLayout(LayoutKind.Sequential)]
     private struct IO_COUNTERS
@@ -35,7 +35,7 @@ class Program
         public ulong WriteOperationCount;
         public ulong OtherOperationCount;
         public ulong ReadTransferCount;
-        public ulong WriteTransferCount; // 包含了网络 Socket 发送和磁盘写入的总字节数
+        public ulong WriteTransferCount; // 包含网络 Socket 发送量
         public ulong OtherTransferCount;
     }
 
@@ -54,7 +54,7 @@ class Program
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
     // ==========================================
-    // 3. WASAPI 音频输出监听 (监听对方远程发声)
+    // 3. WASAPI 音频输出监听 (对方远程说话外放)
     // ==========================================
     [DllImport("ole32.dll", ExactSpelling = true)]
     private static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
@@ -129,22 +129,34 @@ class Program
     }
 
     // ==========================================
-    // 4. 业务监控状态
+    // 4. 业务状态跟踪
     // ==========================================
     private static readonly string LogFilePath = @"D:\Remote_Activity_Log.txt";
-    
-    // 判定为“正在视频推流”的写入速率门限（单位：KB/s）
-    // 视频传输（720P/1080P）通常在 150KB/s ~ 1500KB/s 以上
-    private const double VIDEO_STREAM_THRESHOLD_KB = 120.0;
 
-    // 记录各进程历史 IO 状态
+    // 判定为视频流的速率阈值 (KB/s)
+    private const double VIDEO_STREAM_THRESHOLD_KB = 120.0;
+    // 必须持续达到该时长才触发提示音 (秒)
+    private const double MIN_STREAM_DURATION_SECONDS = 5.0;
+    // 流量中断超过该时长判定为彻底停止 (秒)
+    private const double STOP_TOLERANCE_SECONDS = 2.0;
+
+    // 记录历史 IO
     private static readonly Dictionary<int, (ulong LastBytes, DateTime LastTime)> _processIoHistory = new();
-    private static readonly HashSet<int> _activeStreamingPids = new();
+
+    // 持续传输计时器状态类
+    private class StreamState
+    {
+        public DateTime StartTime;         // 流量首次超标的时间
+        public DateTime LastHighTraffic;   // 最近一次超标的时间
+        public bool HasAlerted;            // 是否已经播放过“插入”提示音
+    }
+
+    private static readonly Dictionary<int, StreamState> _streamStates = new();
     private static readonly HashSet<uint> _activeSpeakerPids = new();
 
     static void Main(string[] args)
     {
-        // 自动隐藏黑框（静默运行）
+        // 自动隐藏黑框静默运行
         IntPtr hConsole = GetConsoleWindow();
         if (hConsole != IntPtr.Zero)
         {
@@ -157,31 +169,32 @@ class Program
         {
             try
             {
-                // 1. 监控：远控推流传输（突发大流量发送 -> 拔插U盘音效）
-                MonitorDataStreaming();
+                // 1. 持续5秒以上视频推流监控
+                MonitorDataStreamingWithTimer();
 
-                // 2. 监控：远控说话外放（扬声器播放声音 -> 记录日志到 D 盘）
+                // 2. 远控声音外放监控
                 MonitorRemoteVoicePlayback();
             }
             catch { }
 
-            Thread.Sleep(300); // 300ms 采样周期，灵敏且极低 CPU 占用
+            Thread.Sleep(300); // 300ms 采样周期
         }
     }
 
     /// <summary>
-    /// 监测进程的实时写入速率，判断是否正在向远端发送视频流
+    /// 带 5 秒防误报计时器的流量检测
     /// </summary>
-    static void MonitorDataStreaming()
+    static void MonitorDataStreamingWithTimer()
     {
         Process[] processes = Process.GetProcesses();
         DateTime now = DateTime.Now;
-        var currentActiveStreaming = new HashSet<int>();
+        var activePidsInSystem = new HashSet<int>();
 
         foreach (var p in processes)
         {
             int pid = p.Id;
-            if (pid <= 4) continue; // 跳过 System/Idle 进程
+            if (pid <= 4) continue;
+            activePidsInSystem.Add(pid);
 
             IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
             if (hProcess == IntPtr.Zero) continue;
@@ -197,20 +210,34 @@ class Program
                         double elapsedSeconds = (now - lastRecord.LastTime).TotalSeconds;
                         if (elapsedSeconds > 0.1)
                         {
-                            // 计算此进程当前的写入速率 (KB/s)
                             double speedKBps = ((currentBytes - lastRecord.LastBytes) / 1024.0) / elapsedSeconds;
 
-                            // 如果速率超过阈值，判定为正在传输推流数据
+                            // 流量超过推流门限
                             if (speedKBps >= VIDEO_STREAM_THRESHOLD_KB)
                             {
-                                currentActiveStreaming.Add(pid);
-
-                                if (!_activeStreamingPids.Contains(pid))
+                                if (!_streamStates.TryGetValue(pid, out StreamState state))
                                 {
-                                    string procPath = GetProcessPath(hProcess, pid);
-                                    WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [开始推流] 进程: {procPath}, 速率: {speedKBps:F1} KB/s");
-                                    PlayUsbConnect(); // 开始传输画面 -> 发出插 U 盘提示音
-                                    _activeStreamingPids.Add(pid);
+                                    // 首次进入高速传输，开启计时
+                                    _streamStates[pid] = new StreamState
+                                    {
+                                        StartTime = now,
+                                        LastHighTraffic = now,
+                                        HasAlerted = false
+                                    };
+                                }
+                                else
+                                {
+                                    // 持续高速传输，更新最后活跃时间
+                                    state.LastHighTraffic = now;
+
+                                    // 核心逻辑：只有持续超标 >= 5 秒且尚未报警，才响铃！
+                                    if (!state.HasAlerted && (now - state.StartTime).TotalSeconds >= MIN_STREAM_DURATION_SECONDS)
+                                    {
+                                        state.HasAlerted = true;
+                                        string procPath = GetProcessPath(hProcess, pid);
+                                        WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [确认拉流] 进程连续传输超过 5 秒: {procPath}, 瞬时速率: {speedKBps:F1} KB/s");
+                                        PlayUsbConnect(); // 触发：插入U盘音效
+                                    }
                                 }
                             }
                         }
@@ -225,26 +252,39 @@ class Program
             }
         }
 
-        // 检查哪些进程停止了推流
-        var stoppedPids = new List<int>();
-        foreach (int pid in _activeStreamingPids)
+        // 处理超时与停止
+        var toRemove = new List<int>();
+        foreach (var kvp in _streamStates)
         {
-            if (!currentActiveStreaming.Contains(pid))
+            int pid = kvp.Key;
+            StreamState state = kvp.Value;
+
+            bool isProcessDead = !activePidsInSystem.Contains(pid);
+            bool isTrafficStopped = (now - state.LastHighTraffic).TotalSeconds > STOP_TOLERANCE_SECONDS;
+
+            // 进程死掉或者停止传输超过 2 秒
+            if (isProcessDead || isTrafficStopped)
             {
-                stoppedPids.Add(pid);
-                WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [停止推流] PID: {pid} 已断开/停止视频传输");
-                PlayUsbDisconnect(); // 停止传输画面 -> 发出拔 U 盘提示音
+                // 如果曾经响过“插入”提示音，现在停止了，必须响“拔出”提示音
+                if (state.HasAlerted)
+                {
+                    WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [停止拉流] PID: {pid} 已停止持续推流");
+                    PlayUsbDisconnect(); // 触发：拔出U盘音效
+                }
+
+                // 如果没达到 5 秒就停了（纯心跳探测包），直接丢弃，不响任何音效，完美防误报
+                toRemove.Add(pid);
             }
         }
 
-        foreach (int pid in stoppedPids)
+        foreach (int pid in toRemove)
         {
-            _activeStreamingPids.Remove(pid);
+            _streamStates.Remove(pid);
         }
     }
 
     /// <summary>
-    /// 监测扬声器/耳机输出：当有远控进程在本地播放对方语音时记录日志
+    /// 扬声器输出检测（对方远端开麦讲话）
     /// </summary>
     static void MonitorRemoteVoicePlayback()
     {
@@ -260,7 +300,7 @@ class Program
             int hr = CoCreateInstance(CLSID_MMDeviceEnumerator, IntPtr.Zero, 1, IID_IMMDeviceEnumerator, out enumerator);
             if (hr != 0 || enumerator == null) return;
 
-            // eRender = 0 (监听扬声器/播放输出端), eConsole = 0
+            // eRender = 0 (输出/播放设备)
             hr = enumerator.GetDefaultAudioEndpoint(0, 0, out speakerDevice);
             if (hr != 0 || speakerDevice == null) return;
 
@@ -283,8 +323,7 @@ class Program
                     if (session == null) continue;
 
                     session.GetState(out int state);
-                    // state == 1 代表该会话正在外放声音
-                    if (state == 1)
+                    if (state == 1) // 正在播放声音
                     {
                         session.GetProcessId(out uint pid);
                         if (pid > 0)
@@ -294,8 +333,7 @@ class Program
                             if (!_activeSpeakerPids.Contains(pid))
                             {
                                 string procName = GetProcessNameOnly((int)pid);
-                                // 过滤掉常见的正常播放软件（如果需要可以自行调整）
-                                WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [语音上线] 进程正在外放声音 (对方可能在讲话): {procName} (PID: {pid})");
+                                WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [语音上线] 进程正在向扬声器发声 (对方在说话): {procName} (PID: {pid})");
                                 _activeSpeakerPids.Add(pid);
                             }
                         }
