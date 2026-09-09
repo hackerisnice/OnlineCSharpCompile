@@ -9,23 +9,39 @@ using System.Runtime.InteropServices;
 class Program
 {
     // =========================================================================
-    // 动态时间配置 (可通过托盘菜单实时切换)
+    // 1. 核心参数与状态控制
     // =========================================================================
-    private static double _minStreamDurationSeconds = 2.5; // 默认 2.5 秒
-    private const double TRAFFIC_THRESHOLD_KB = 80.0;       // 视频流速率门限 (KB/s)
-    private const double STOP_TOLERANCE_SECONDS = 1.5;      // 停止容差时间 (秒)
     private static readonly string LogFilePath = @"D:\Remote_Activity_Log.txt";
 
-    // 浏览器隔离名单
-    private static readonly HashSet<string> ExcludedBrowsers = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "chrome", "msedge", "firefox", "opera", "brave", "360se", "360chrome",
-        "qqbrowser", "sogouexplorer", "2345explorer", "liebao", "maxthon",
-        "msedgewebview2", "conhost"
-    };
+    // 判定为视频流的速率阈值 (KB/s)
+    private const double VIDEO_STREAM_THRESHOLD_KB = 120.0;
+    // 判定时间按要求改为 2.0 秒 (持续推流满 2 秒才触发插U盘音效)
+    private const double MIN_STREAM_DURATION_SECONDS = 2.0;
+    // 流量中断超过该时长判定为断开 (秒)
+    private const double STOP_TOLERANCE_SECONDS = 2.0;
+
+    // 全局监听开关 (默认开启)
+    private static volatile bool _isMonitoring = true;
 
     // =========================================================================
-    // Win32 常量与结构体定义
+    // 2. Win32 系统音效 & 窗口控制
+    // ==========================================
+    [DllImport("winmm.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool PlaySound(string pszSound, IntPtr hmod, uint fdwSound);
+    private const uint SND_ASYNC = 0x0001;
+    private const uint SND_ALIAS = 0x00010000;
+
+    static void PlayUsbConnect() => PlaySound("DeviceConnect", IntPtr.Zero, SND_ALIAS | SND_ASYNC);
+    static void PlayUsbDisconnect() => PlaySound("DeviceDisconnect", IntPtr.Zero, SND_ALIAS | SND_ASYNC);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_HIDE = 0;
+
+    // =========================================================================
+    // 3. 原生任务栏托盘与伪装控制面板菜单
     // =========================================================================
     private const int WM_USER = 0x0400;
     private const int WM_TRAYICON = WM_USER + 1;
@@ -85,7 +101,7 @@ class Program
     }
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-    private static WndProcDelegate _wndProc; // 保持静态引用，防止 GC 回收委托
+    private static WndProcDelegate _wndProc;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct WNDCLASSEX
@@ -104,7 +120,6 @@ class Program
         public IntPtr hIconSm;
     }
 
-    // Win32 API
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern ushort RegisterClassEx(ref WNDCLASSEX lpwcx);
 
@@ -158,41 +173,9 @@ class Program
     [DllImport("user32.dll")]
     private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetConsoleWindow();
-
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("winmm.dll", CharSet = CharSet.Auto)]
-    private static extern bool PlaySound(string pszSound, IntPtr hmod, uint fdwSound);
-
-    [DllImport("user32.dll")]
-    private static extern bool MessageBeep(uint uType);
-
-    private const uint SOUND_FLAGS = 0x00210001; // SND_ASYNC | SND_ALIAS | SND_SYSTEM
-
-    static void PlayUsbConnect()
-    {
-        if (!PlaySound("DeviceConnect", IntPtr.Zero, SOUND_FLAGS))
-            MessageBeep(0x00000040);
-    }
-
-    static void PlayUsbDisconnect()
-    {
-        if (!PlaySound("DeviceDisconnect", IntPtr.Zero, SOUND_FLAGS))
-            MessageBeep(0x00000030);
-    }
-
     // =========================================================================
-    // 内核网络 & IO API
+    // 4. 原版 I/O 速率监测 API
     // =========================================================================
-    [DllImport("iphlpapi.dll", SetLastError = true)]
-    private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, int TableClass, uint Reserved);
-
-    [DllImport("iphlpapi.dll", SetLastError = true)]
-    private static extern uint GetExtendedUdpTable(IntPtr pUdpTable, ref int pdwSize, bool bOrder, int ulAf, int TableClass, uint Reserved);
-
     [StructLayout(LayoutKind.Sequential)]
     private struct IO_COUNTERS
     {
@@ -207,8 +190,8 @@ class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessIoCounters(IntPtr hProcess, out IO_COUNTERS lpIoCounters);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool QueryFullProcessImageName(IntPtr hProcess, int dwFlags, StringBuilder lpExeName, ref int lpdwSize);
@@ -216,8 +199,10 @@ class Program
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
     // =========================================================================
-    // WASAPI COM 接口定义
+    // 5. WASAPI 音频输出监听 (对方开麦说话外放)
     // =========================================================================
     [DllImport("ole32.dll", ExactSpelling = true)]
     private static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
@@ -225,7 +210,8 @@ class Program
     [DllImport("ole32.dll", ExactSpelling = true)]
     private static extern int CoCreateInstance(
         [In, MarshalAs(UnmanagedType.LPStruct)] Guid rclsid,
-        IntPtr pUnkOuter, uint dwClsContext,
+        IntPtr pUnkOuter,
+        uint dwClsContext,
         [In, MarshalAs(UnmanagedType.LPStruct)] Guid riid,
         [MarshalAs(UnmanagedType.Interface)] out IMMDeviceEnumerator ppv);
 
@@ -281,175 +267,39 @@ class Program
     }
 
     // =========================================================================
-    // 业务状态管理
+    // 6. 业务状态容器
     // =========================================================================
-    private class NetworkStreamTracker
+    private static readonly Dictionary<int, (ulong LastBytes, DateTime LastTime)> _processIoHistory = new();
+
+    private class StreamState
     {
-        public DateTime FirstSurgeTime;
-        public DateTime LastSurgeTime;
-        public ulong LastBytes;
-        public DateTime LastSampleTime;
+        public DateTime StartTime;
+        public DateTime LastHighTraffic;
         public bool HasAlerted;
-        public string ProcessFullPath;
-        public string ProcessName;
     }
 
-    private static readonly Dictionary<int, NetworkStreamTracker> _trackedStreams = new();
+    private static readonly Dictionary<int, StreamState> _streamStates = new();
     private static readonly HashSet<uint> _activeSpeakerPids = new();
     private static NOTIFYICONDATA _nid;
-    private static readonly double[] DurationOptions = new double[] { 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0 };
 
     static void Main()
     {
-        // 1. 静默运行：自动隐藏控制台黑框
+        // 自动隐藏黑框静默运行
         IntPtr hConsole = GetConsoleWindow();
-        if (hConsole != IntPtr.Zero) ShowWindow(hConsole, 0);
+        if (hConsole != IntPtr.Zero) ShowWindow(hConsole, SW_HIDE);
 
         CoInitializeEx(IntPtr.Zero, 0);
 
-        // 2. 启动后台监控工作线程
-        Thread workerThread = new Thread(MonitoringWorkerLoop)
-        {
-            IsBackground = true
-        };
+        // 启动监控工作后台线程
+        Thread workerThread = new(MonitoringWorkerLoop) { IsBackground = true };
         workerThread.Start();
 
-        // 3. 主线程运行 Win32 托盘图标与消息循环
+        // 主线程运行托盘伪装与菜单循环
         RunTrayIconMessageLoop();
     }
 
     /// <summary>
-    /// 初始化伪装成“控制面板”的托盘图标并运行消息循环
-    /// </summary>
-    static void RunTrayIconMessageLoop()
-    {
-        string className = "ControlPanelTrayMsgWindow";
-        _wndProc = WndProc;
-
-        WNDCLASSEX wc = new WNDCLASSEX
-        {
-            cbSize = Marshal.SizeOf(typeof(WNDCLASSEX)),
-            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc),
-            lpszClassName = className
-        };
-        RegisterClassEx(ref wc);
-
-        IntPtr hWnd = CreateWindowEx(0, className, "ControlPanelProxy", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-        if (hWnd == IntPtr.Zero) return;
-
-        // 获取真实的控制面板原生图标
-        IntPtr hIcon = IntPtr.Zero;
-        string sysDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
-        string controlPath = Path.Combine(sysDir, "control.exe");
-        if (File.Exists(controlPath))
-        {
-            ExtractIconEx(controlPath, 0, out _, out hIcon, 1);
-        }
-        if (hIcon == IntPtr.Zero)
-        {
-            ExtractIconEx("shell32.dll", 21, out _, out hIcon, 1);
-        }
-
-        // 添加任务栏托盘图标
-        _nid = new NOTIFYICONDATA
-        {
-            cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA)),
-            hWnd = hWnd,
-            uID = 1001,
-            uFlags = (int)(NIF_MESSAGE | NIF_ICON | NIF_TIP),
-            uCallbackMessage = WM_TRAYICON,
-            hIcon = hIcon,
-            szTip = "控制面板" // 伪装悬停文本
-        };
-        Shell_NotifyIcon(NIM_ADD, ref _nid);
-
-        // 标准 Win32 消息循环
-        while (GetMessage(out MSG msg, IntPtr.Zero, 0, 0) > 0)
-        {
-            TranslateMessage(ref msg);
-            DispatchMessage(ref msg);
-        }
-
-        // 退出时清理托盘图标
-        Shell_NotifyIcon(NIM_DELETE, ref _nid);
-    }
-
-    /// <summary>
-    /// 窗口过程回调：响应托盘点击事件
-    /// </summary>
-    static IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
-    {
-        if (msg == WM_TRAYICON)
-        {
-            uint mouseMsg = (uint)lParam.ToInt64() & 0xFFFF;
-            // 左键或右键点击均弹出时间切换菜单
-            if (mouseMsg == WM_LBUTTONUP || mouseMsg == WM_RBUTTONUP)
-            {
-                ShowDurationPopupMenu(hWnd);
-            }
-            return IntPtr.Zero;
-        }
-        return DefWindowProc(hWnd, msg, wParam, lParam);
-    }
-
-    /// <summary>
-    /// 弹出时间切换列表菜单（带选中状态，即选即隐）
-    /// </summary>
-    static void ShowDurationPopupMenu(IntPtr hWnd)
-    {
-        IntPtr hMenu = CreatePopupMenu();
-        if (hMenu == IntPtr.Zero) return;
-
-        // 动态构建选项列表：1.0 到 5.0 秒
-        for (int i = 0; i < DurationOptions.Length; i++)
-        {
-            double duration = DurationOptions[i];
-            uint flags = MF_STRING;
-
-            // 当前时间显示选中的 ✓
-            if (Math.Abs(duration - _minStreamDurationSeconds) < 0.01)
-            {
-                flags |= MF_CHECKED;
-            }
-            else
-            {
-                flags |= MF_UNCHECKED;
-            }
-
-            AppendMenu(hMenu, flags, (UIntPtr)(100 + i), $"{duration:0.0} 秒");
-        }
-
-        // 退出项 (以备退出程序所需)
-        AppendMenu(hMenu, MF_SEPARATOR, UIntPtr.Zero, string.Empty);
-        AppendMenu(hMenu, MF_STRING, (UIntPtr)999, "退出");
-
-        GetCursorPos(out POINT pt);
-        SetForegroundWindow(hWnd);
-
-        // TPM_RETURNCMD 使得用户选择后直接返回菜单 ID，无需弹窗提示
-        int selectedId = TrackPopupMenuEx(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.X, pt.Y, hWnd, IntPtr.Zero);
-        PostMessage(hWnd, WM_NULL, IntPtr.Zero, IntPtr.Zero); // 规避 Windows 托盘失焦 BUG
-
-        DestroyMenu(hMenu);
-
-        if (selectedId >= 100 && selectedId < 100 + DurationOptions.Length)
-        {
-            // 实时应用新时间，无任何提示框
-            _minStreamDurationSeconds = DurationOptions[selectedId - 100];
-            Log($"[设置更新] 判定时间已调整为: {_minStreamDurationSeconds:0.0} 秒");
-        }
-        else if (selectedId == 999)
-        {
-            // 正常退出程序
-            Shell_NotifyIcon(NIM_DELETE, ref _nid);
-            DestroyWindow(hWnd);
-            PostQuitMessage(0);
-            Environment.Exit(0);
-        }
-    }
-
-    /// <summary>
-    /// 后台监听主循环
+    /// 后台监控主循环（受 _isMonitoring 开关控制）
     /// </summary>
     static void MonitoringWorkerLoop()
     {
@@ -457,189 +307,129 @@ class Program
 
         while (true)
         {
-            try
+            if (_isMonitoring)
             {
-                MonitorActiveNetworkStreaming();
-                MonitorSpeakerPlayback();
-            }
-            catch { }
+                try
+                {
+                    // 1. 原版带 2 秒持续判定的推流监控
+                    MonitorDataStreamingWithTimer();
 
-            Thread.Sleep(200); // 200ms 采样
+                    // 2. 原版远控声音外放监控
+                    MonitorRemoteVoicePlayback();
+                }
+                catch { }
+            }
+
+            Thread.Sleep(300); // 维持原版 300ms 采样周期
         }
     }
 
     /// <summary>
-    /// 监测向外推流（网络 + 流量 实时动态判定）
+    /// 原版：带计时器的流量检测（持续 2 秒防误报）
     /// </summary>
-    static void MonitorActiveNetworkStreaming()
+    static void MonitorDataStreamingWithTimer()
     {
-        HashSet<int> networkPids = GetProcessesWithExternalNetwork();
+        Process[] processes = Process.GetProcesses();
         DateTime now = DateTime.Now;
-        var alivePids = new HashSet<int>();
+        var activePidsInSystem = new HashSet<int>();
 
-        foreach (int pid in networkPids)
+        foreach (var p in processes)
         {
-            alivePids.Add(pid);
+            int pid = p.Id;
+            if (pid <= 4) continue;
+            activePidsInSystem.Add(pid);
 
-            IntPtr hProc = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
-            if (hProc == IntPtr.Zero) continue;
+            IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProcess == IntPtr.Zero) continue;
 
             try
             {
-                string procPath = GetProcessFullPath(hProc, pid);
-                string procName = Path.GetFileNameWithoutExtension(procPath);
-
-                // 排除浏览器家族，绝对防止上网误报
-                if (ExcludedBrowsers.Contains(procName)) continue;
-
-                if (GetProcessIoCounters(hProc, out IO_COUNTERS io))
+                if (GetProcessIoCounters(hProcess, out IO_COUNTERS io))
                 {
                     ulong currentBytes = io.WriteTransferCount;
 
-                    if (!_trackedStreams.TryGetValue(pid, out NetworkStreamTracker tracker))
+                    if (_processIoHistory.TryGetValue(pid, out var lastRecord))
                     {
-                        _trackedStreams[pid] = new NetworkStreamTracker
+                        double elapsedSeconds = (now - lastRecord.LastTime).TotalSeconds;
+                        if (elapsedSeconds > 0.1)
                         {
-                            FirstSurgeTime = now,
-                            LastSurgeTime = now,
-                            LastBytes = currentBytes,
-                            LastSampleTime = now,
-                            HasAlerted = false,
-                            ProcessFullPath = procPath,
-                            ProcessName = procName
-                        };
-                    }
-                    else
-                    {
-                        double elapsed = (now - tracker.LastSampleTime).TotalSeconds;
-                        if (elapsed > 0.15)
-                        {
-                            double speedKB = ((currentBytes - tracker.LastBytes) / 1024.0) / elapsed;
+                            double speedKBps = ((currentBytes - lastRecord.LastBytes) / 1024.0) / elapsedSeconds;
 
-                            if (speedKB >= TRAFFIC_THRESHOLD_KB)
+                            // 流量超过推流门限
+                            if (speedKBps >= VIDEO_STREAM_THRESHOLD_KB)
                             {
-                                tracker.LastSurgeTime = now;
-
-                                // 依据动态选定的 _minStreamDurationSeconds 判定
-                                if (!tracker.HasAlerted && (now - tracker.FirstSurgeTime).TotalSeconds >= _minStreamDurationSeconds)
+                                if (!_streamStates.TryGetValue(pid, out StreamState state))
                                 {
-                                    tracker.HasAlerted = true;
-                                    Log($"[警报] 检测到画面向外推流传输! 进程: {tracker.ProcessName} (PID: {pid}), 判定时间: {_minStreamDurationSeconds:0.0}秒, 速率: {speedKB:F1} KB/s");
-                                    PlayUsbConnect(); // 响铃：插入U盘音
+                                    _streamStates[pid] = new StreamState
+                                    {
+                                        StartTime = now,
+                                        LastHighTraffic = now,
+                                        HasAlerted = false
+                                    };
+                                }
+                                else
+                                {
+                                    state.LastHighTraffic = now;
+
+                                    // 核心逻辑：持续超标 >= 2.0 秒且尚未报警，才响铃！
+                                    if (!state.HasAlerted && (now - state.StartTime).TotalSeconds >= MIN_STREAM_DURATION_SECONDS)
+                                    {
+                                        state.HasAlerted = true;
+                                        string procPath = GetProcessPath(hProcess, pid);
+                                        WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [确认拉流] 进程连续传输超过 2 秒: {procPath}, 瞬时速率: {speedKBps:F1} KB/s");
+                                        PlayUsbConnect(); // 触发：插入U盘音效
+                                    }
                                 }
                             }
-
-                            tracker.LastBytes = currentBytes;
-                            tracker.LastSampleTime = now;
                         }
                     }
+
+                    _processIoHistory[pid] = (currentBytes, now);
                 }
             }
             finally
             {
-                CloseHandle(hProc);
+                CloseHandle(hProcess);
             }
         }
 
-        // 停止/断开检测
-        var stoppedPids = new List<int>();
-        foreach (var kvp in _trackedStreams)
+        // 处理超时与停止
+        var toRemove = new List<int>();
+        foreach (var kvp in _streamStates)
         {
             int pid = kvp.Key;
-            var tracker = kvp.Value;
+            StreamState state = kvp.Value;
 
-            bool isProcessDead = !alivePids.Contains(pid);
-            bool isTrafficSilent = (now - tracker.LastSurgeTime).TotalSeconds > STOP_TOLERANCE_SECONDS;
+            bool isProcessDead = !activePidsInSystem.Contains(pid);
+            bool isTrafficStopped = (now - state.LastHighTraffic).TotalSeconds > STOP_TOLERANCE_SECONDS;
 
-            if (isProcessDead || isTrafficSilent)
+            if (isProcessDead || isTrafficStopped)
             {
-                if (tracker.HasAlerted)
+                if (state.HasAlerted)
                 {
-                    Log($"[恢复] 画面拉流已停止/通道断开! 进程: {tracker.ProcessName} (PID: {pid})");
-                    PlayUsbDisconnect(); // 响铃：拔出U盘音
+                    WriteLog($"[时间: {now:yyyy-MM-dd HH:mm:ss}] [停止拉流] PID: {pid} 已停止持续推流");
+                    PlayUsbDisconnect(); // 触发：拔出U盘音效
                 }
-                stoppedPids.Add(pid);
+                toRemove.Add(pid);
             }
         }
 
-        foreach (int pid in stoppedPids)
+        foreach (int pid in toRemove)
         {
-            _trackedStreams.Remove(pid);
+            _streamStates.Remove(pid);
         }
     }
 
     /// <summary>
-    /// 获取当前系统内所有持有外部 TCP/UDP 连接的进程 PID
+    /// 原版：扬声器输出检测（对方远端开麦讲话）
     /// </summary>
-    static HashSet<int> GetProcessesWithExternalNetwork()
-    {
-        var pids = new HashSet<int>();
-
-        // 1. TCP 连接表
-        int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2 /* AF_INET */, 5 /* TCP_TABLE_OWNER_PID_ALL */, 0);
-        if (size > 0)
-        {
-            IntPtr buffer = Marshal.AllocHGlobal(size);
-            try
-            {
-                if (GetExtendedTcpTable(buffer, ref size, false, 2, 5, 0) == 0)
-                {
-                    int numEntries = Marshal.ReadInt32(buffer);
-                    IntPtr rowPtr = IntPtr.Add(buffer, 4);
-                    for (int i = 0; i < numEntries; i++)
-                    {
-                        uint state = (uint)Marshal.ReadInt32(rowPtr, 0);
-                        uint remoteAddr = (uint)Marshal.ReadInt32(rowPtr, 12);
-                        uint pid = (uint)Marshal.ReadInt32(rowPtr, 20);
-
-                        // state == 5 (ESTABLISHED), 排除本机回环
-                        if (state == 5 && remoteAddr != 0 && remoteAddr != 0x0100007F)
-                        {
-                            if (pid > 4) pids.Add((int)pid);
-                        }
-                        rowPtr = IntPtr.Add(rowPtr, 24);
-                    }
-                }
-            }
-            finally { Marshal.FreeHGlobal(buffer); }
-        }
-
-        // 2. UDP 传输套接字
-        size = 0;
-        GetExtendedUdpTable(IntPtr.Zero, ref size, false, 2 /* AF_INET */, 1 /* UDP_TABLE_OWNER_PID */, 0);
-        if (size > 0)
-        {
-            IntPtr buffer = Marshal.AllocHGlobal(size);
-            try
-            {
-                if (GetExtendedUdpTable(buffer, ref size, false, 2, 1, 0) == 0)
-                {
-                    int numEntries = Marshal.ReadInt32(buffer);
-                    IntPtr rowPtr = IntPtr.Add(buffer, 4);
-                    for (int i = 0; i < numEntries; i++)
-                    {
-                        uint pid = (uint)Marshal.ReadInt32(rowPtr, 8);
-                        if (pid > 4) pids.Add((int)pid);
-                        rowPtr = IntPtr.Add(rowPtr, 12);
-                    }
-                }
-            }
-            finally { Marshal.FreeHGlobal(buffer); }
-        }
-
-        return pids;
-    }
-
-    /// <summary>
-    /// 扬声器外放监听 (远控语音开麦)
-    /// </summary>
-    static void MonitorSpeakerPlayback()
+    static void MonitorRemoteVoicePlayback()
     {
         IMMDeviceEnumerator enumerator = null;
-        IMMDevice speaker = null;
-        IAudioSessionManager2 mgr = null;
+        IMMDevice speakerDevice = null;
+        IAudioSessionManager2 sessionManager = null;
         IAudioSessionEnumerator sessionEnum = null;
+
         var currentPids = new HashSet<uint>();
 
         try
@@ -647,15 +437,15 @@ class Program
             int hr = CoCreateInstance(CLSID_MMDeviceEnumerator, IntPtr.Zero, 1, IID_IMMDeviceEnumerator, out enumerator);
             if (hr != 0 || enumerator == null) return;
 
-            hr = enumerator.GetDefaultAudioEndpoint(0 /* eRender */, 0, out speaker);
-            if (hr != 0 || speaker == null) return;
+            hr = enumerator.GetDefaultAudioEndpoint(0, 0, out speakerDevice);
+            if (hr != 0 || speakerDevice == null) return;
 
             Guid iidMgr = IID_IAudioSessionManager2;
-            hr = speaker.Activate(ref iidMgr, 23, IntPtr.Zero, out object objMgr);
-            if (hr != 0 || objMgr == null) return;
+            hr = speakerDevice.Activate(ref iidMgr, 23, IntPtr.Zero, out object sessionManagerObj);
+            if (hr != 0 || sessionManagerObj == null) return;
 
-            mgr = (IAudioSessionManager2)objMgr;
-            hr = mgr.GetSessionEnumerator(out sessionEnum);
+            sessionManager = (IAudioSessionManager2)sessionManagerObj;
+            hr = sessionManager.GetSessionEnumerator(out sessionEnum);
             if (hr != 0 || sessionEnum == null) return;
 
             sessionEnum.GetCount(out int count);
@@ -669,7 +459,7 @@ class Program
                     if (session == null) continue;
 
                     session.GetState(out int state);
-                    if (state == 1) // 播放中
+                    if (state == 1)
                     {
                         session.GetProcessId(out uint pid);
                         if (pid > 0)
@@ -679,11 +469,8 @@ class Program
                             if (!_activeSpeakerPids.Contains(pid))
                             {
                                 string procName = GetProcessNameOnly((int)pid);
-                                if (!ExcludedBrowsers.Contains(procName.Replace(".exe", "")))
-                                {
-                                    Log($"[语音] 远端开麦讲话/向扬声器外放声音: {procName} (PID: {pid})");
-                                    _activeSpeakerPids.Add(pid);
-                                }
+                                WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [语音上线] 进程正在向扬声器发声 (对方在说话): {procName} (PID: {pid})");
+                                _activeSpeakerPids.Add(pid);
                             }
                         }
                     }
@@ -697,33 +484,162 @@ class Program
         finally
         {
             if (sessionEnum != null) Marshal.ReleaseComObject(sessionEnum);
-            if (mgr != null) Marshal.ReleaseComObject(mgr);
-            if (speaker != null) Marshal.ReleaseComObject(speaker);
+            if (sessionManager != null) Marshal.ReleaseComObject(sessionManager);
+            if (speakerDevice != null) Marshal.ReleaseComObject(speakerDevice);
             if (enumerator != null) Marshal.ReleaseComObject(enumerator);
         }
 
         _activeSpeakerPids.RemoveWhere(pid => !currentPids.Contains(pid));
     }
 
-    static string GetProcessFullPath(IntPtr hProc, int pid)
+    // =========================================================================
+    // 7. 托盘初始化与左/右键菜单事件响应
+    // =========================================================================
+    static void RunTrayIconMessageLoop()
+    {
+        string className = "ControlPanelTrayMsgWindow";
+        _wndProc = WndProc;
+
+        WNDCLASSEX wc = new()
+        {
+            cbSize = Marshal.SizeOf(typeof(WNDCLASSEX)),
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProc),
+            lpszClassName = className
+        };
+        RegisterClassEx(ref wc);
+
+        IntPtr hWnd = CreateWindowEx(0, className, "ControlPanelProxy", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (hWnd == IntPtr.Zero) return;
+
+        // 提取系统 control.exe 图标实现完美伪装
+        IntPtr hIcon = IntPtr.Zero;
+        string sysDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
+        string controlPath = Path.Combine(sysDir, "control.exe");
+        if (File.Exists(controlPath))
+        {
+            ExtractIconEx(controlPath, 0, out _, out hIcon, 1);
+        }
+        if (hIcon == IntPtr.Zero)
+        {
+            ExtractIconEx("shell32.dll", 21, out _, out hIcon, 1);
+        }
+
+        _nid = new NOTIFYICONDATA
+        {
+            cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA)),
+            hWnd = hWnd,
+            uID = 1001,
+            uFlags = (int)(NIF_MESSAGE | NIF_ICON | NIF_TIP),
+            uCallbackMessage = WM_TRAYICON,
+            hIcon = hIcon,
+            szTip = "控制面板"
+        };
+        Shell_NotifyIcon(NIM_ADD, ref _nid);
+
+        while (GetMessage(out MSG msg, IntPtr.Zero, 0, 0) > 0)
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+
+        Shell_NotifyIcon(NIM_DELETE, ref _nid);
+    }
+
+    static IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        if (msg == WM_TRAYICON)
+        {
+            uint mouseMsg = (uint)lParam.ToInt64() & 0xFFFF;
+            // 无论是左键还是右键点击，都弹出控制菜单
+            if (mouseMsg == WM_LBUTTONUP || mouseMsg == WM_RBUTTONUP)
+            {
+                ShowControlPopupMenu(hWnd);
+            }
+            return IntPtr.Zero;
+        }
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+
+    static void ShowControlPopupMenu(IntPtr hWnd)
+    {
+        IntPtr hMenu = CreatePopupMenu();
+        if (hMenu == IntPtr.Zero) return;
+
+        // 选项1：开始监听 (如果当前是监听状态，显示 ✓)
+        uint startFlags = MF_STRING | (_isMonitoring ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenu(hMenu, startFlags, (UIntPtr)101, "开始监听");
+
+        // 选项2：暂停监听 (如果当前是暂停状态，显示 ✓)
+        uint pauseFlags = MF_STRING | (!_isMonitoring ? MF_CHECKED : MF_UNCHECKED);
+        AppendMenu(hMenu, pauseFlags, (UIntPtr)102, "暂停监听");
+
+        // 分割线与退出项
+        AppendMenu(hMenu, MF_SEPARATOR, UIntPtr.Zero, string.Empty);
+        AppendMenu(hMenu, MF_STRING, (UIntPtr)999, "退出");
+
+        GetCursorPos(out POINT pt);
+        SetForegroundWindow(hWnd);
+
+        // 即选即隐，返回被点击的菜单 ID，不产生任何弹出提示框
+        int selectedId = TrackPopupMenuEx(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.X, pt.Y, hWnd, IntPtr.Zero);
+        PostMessage(hWnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+
+        DestroyMenu(hMenu);
+
+        if (selectedId == 101)
+        {
+            _isMonitoring = true;
+            WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [用户切换] 已切换为: 开始监听");
+        }
+        else if (selectedId == 102)
+        {
+            _isMonitoring = false;
+            // 暂停时清空追踪缓冲，避免重新开始时误触发
+            _streamStates.Clear();
+            _processIoHistory.Clear();
+            _activeSpeakerPids.Clear();
+            WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [用户切换] 已切换为: 暂停监听");
+        }
+        else if (selectedId == 999)
+        {
+            Shell_NotifyIcon(NIM_DELETE, ref _nid);
+            DestroyWindow(hWnd);
+            PostQuitMessage(0);
+            Environment.Exit(0);
+        }
+    }
+
+    // =========================================================================
+    // 8. 辅助函数
+    // =========================================================================
+    static string GetProcessPath(IntPtr hProcess, int pid)
     {
         var sb = new StringBuilder(1024);
         int size = sb.Capacity;
-        if (QueryFullProcessImageName(hProc, 0, sb, ref size)) return sb.ToString();
+        if (QueryFullProcessImageName(hProcess, 0, sb, ref size))
+        {
+            return sb.ToString();
+        }
         return GetProcessNameOnly(pid);
     }
 
     static string GetProcessNameOnly(int pid)
     {
-        try { return Process.GetProcessById(pid).ProcessName + ".exe"; }
-        catch { return $"PID_{pid}"; }
+        try
+        {
+            return Process.GetProcessById(pid).ProcessName + ".exe";
+        }
+        catch
+        {
+            return $"PID_{pid}";
+        }
     }
 
-    static void Log(string msg)
+    static void WriteLog(string content)
     {
         try
         {
-            File.AppendAllText(LogFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}{Environment.NewLine}", Encoding.UTF8);
+            File.AppendAllText(LogFilePath, content + Environment.NewLine, Encoding.UTF8);
         }
         catch { }
     }
