@@ -13,9 +13,9 @@ class Program
     // =========================================================================
     private static readonly string LogFilePath = @"D:\Remote_Activity_Log.txt";
 
-    // 判定为视频流的速率阈值 (KB/s)
+    // 判定为常规视频推流的速率阈值 (KB/s)
     private const double VIDEO_STREAM_THRESHOLD_KB = 120.0;
-    // 判定时间按要求改为 2.0 秒 (持续推流满 2 秒才触发插U盘音效)
+    // 持续推流满 2 秒才触发插U盘音效
     private const double MIN_STREAM_DURATION_SECONDS = 2.0;
     // 流量中断超过该时长判定为断开 (秒)
     private const double STOP_TOLERANCE_SECONDS = 2.0;
@@ -280,6 +280,7 @@ class Program
 
     private static readonly Dictionary<int, StreamState> _streamStates = new();
     private static readonly HashSet<uint> _activeSpeakerPids = new();
+    private static readonly HashSet<int> _knownRtcPids = new(); // 追踪 rtcRemoteDesktop.exe 进程
     private static NOTIFYICONDATA _nid;
 
     static void Main()
@@ -311,25 +312,74 @@ class Program
             {
                 try
                 {
-                    // 1. 原版带 2 秒持续判定的推流监控
-                    MonitorDataStreamingWithTimer();
+                    Process[] processes = Process.GetProcesses();
 
-                    // 2. 原版远控声音外放监控
+                    // 1. 关键远控进程秒级识别 (rtcRemoteDesktop.exe)
+                    MonitorSpecificRtcProcess(processes);
+
+                    // 2. 原版带 2 秒持续判定的推流监控
+                    MonitorDataStreamingWithTimer(processes);
+
+                    // 3. 原版远控声音外放监控
                     MonitorRemoteVoicePlayback();
                 }
                 catch { }
             }
 
-            Thread.Sleep(300); // 维持原版 300ms 采样周期
+            Thread.Sleep(300); // 300ms 采样周期
+        }
+    }
+
+    /// <summary>
+    /// 专属检测：一旦 rtcRemoteDesktop.exe 进程启动，必定被监听，立即报提示
+    /// </summary>
+    static void MonitorSpecificRtcProcess(Process[] processes)
+    {
+        var currentRtcPids = new HashSet<int>();
+
+        foreach (var p in processes)
+        {
+            try
+            {
+                // 不区分大小写匹配 rtcRemoteDesktop
+                if (p.ProcessName.Equals("rtcRemoteDesktop", StringComparison.OrdinalIgnoreCase))
+                {
+                    int pid = p.Id;
+                    currentRtcPids.Add(pid);
+
+                    // 首次发现该进程启动，立即秒响
+                    if (!_knownRtcPids.Contains(pid))
+                    {
+                        WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [严重警报] 核心远控进程已启动: rtcRemoteDesktop.exe (PID: {pid})，当前处于绝对被监听状态！");
+                        PlayUsbConnect(); // 立即触发插U盘音效
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // 检测退出事件：若之前记录的 PID 当前已不复存在，说明远控断开
+        foreach (int pid in _knownRtcPids)
+        {
+            if (!currentRtcPids.Contains(pid))
+            {
+                WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [恢复安全] 核心远控进程已退出: rtcRemoteDesktop.exe (PID: {pid})");
+                PlayUsbDisconnect(); // 触发拔出U盘音效
+            }
+        }
+
+        _knownRtcPids.Clear();
+        foreach (int pid in currentRtcPids)
+        {
+            _knownRtcPids.Add(pid);
         }
     }
 
     /// <summary>
     /// 原版：带计时器的流量检测（持续 2 秒防误报）
     /// </summary>
-    static void MonitorDataStreamingWithTimer()
+    static void MonitorDataStreamingWithTimer(Process[] processes)
     {
-        Process[] processes = Process.GetProcesses();
         DateTime now = DateTime.Now;
         var activePidsInSystem = new HashSet<int>();
 
@@ -338,6 +388,12 @@ class Program
             int pid = p.Id;
             if (pid <= 4) continue;
             activePidsInSystem.Add(pid);
+
+            // rtcRemoteDesktop 已有专属高优先级秒级接管，在此跳过，防止重复响铃
+            if (p.ProcessName.Equals("rtcRemoteDesktop", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
 
             IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
             if (hProcess == IntPtr.Zero) continue;
@@ -550,7 +606,6 @@ class Program
         if (msg == WM_TRAYICON)
         {
             uint mouseMsg = (uint)lParam.ToInt64() & 0xFFFF;
-            // 无论是左键还是右键点击，都弹出控制菜单
             if (mouseMsg == WM_LBUTTONUP || mouseMsg == WM_RBUTTONUP)
             {
                 ShowControlPopupMenu(hWnd);
@@ -565,11 +620,11 @@ class Program
         IntPtr hMenu = CreatePopupMenu();
         if (hMenu == IntPtr.Zero) return;
 
-        // 选项1：开始监听 (如果当前是监听状态，显示 ✓)
+        // 选项1：开始监听
         uint startFlags = MF_STRING | (_isMonitoring ? MF_CHECKED : MF_UNCHECKED);
         AppendMenu(hMenu, startFlags, (UIntPtr)101, "开始监听");
 
-        // 选项2：暂停监听 (如果当前是暂停状态，显示 ✓)
+        // 选项2：暂停监听
         uint pauseFlags = MF_STRING | (!_isMonitoring ? MF_CHECKED : MF_UNCHECKED);
         AppendMenu(hMenu, pauseFlags, (UIntPtr)102, "暂停监听");
 
@@ -580,7 +635,6 @@ class Program
         GetCursorPos(out POINT pt);
         SetForegroundWindow(hWnd);
 
-        // 即选即隐，返回被点击的菜单 ID，不产生任何弹出提示框
         int selectedId = TrackPopupMenuEx(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.X, pt.Y, hWnd, IntPtr.Zero);
         PostMessage(hWnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
 
@@ -598,6 +652,7 @@ class Program
             _streamStates.Clear();
             _processIoHistory.Clear();
             _activeSpeakerPids.Clear();
+            _knownRtcPids.Clear();
             WriteLog($"[时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}] [用户切换] 已切换为: 暂停监听");
         }
         else if (selectedId == 999)
